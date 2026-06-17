@@ -1,104 +1,76 @@
-"""Pytest fixtures — thin wiring layer over e2e/."""
+"""E2E VDB lifecycle scenarios."""
 from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Iterator
 
 import pytest
-import requests
-from coe_pylib.gateways import orcv2 as orcv2_gateway  # adjust to real path
+from pytest_bdd import given, scenario, then, when
 
-from e2e import state as state_io
-from e2e.adapters.delphix_dct import DelphixClient
-from e2e.services.dsource import resolve_dsource_name
-from e2e.services.subscriptions import build_vdb_payload
+from e2e.constants import (
+    CLIENT_SUB_STATE_KEY,
+    DELETION_TIMEOUT_S,
+    DSOURCE_NAME_STATE_KEY,
+    MASTER_SUB_STATE_KEY,
+    ONBOARDING_TIMEOUT_S,
+    ONBOARD_ACTION,
+    ONBOARD_PAYLOAD,
+    PROVISIONING_TIMEOUT_S,
+    REFRESH_ACTION,
+    REFRESH_TIMEOUT_S,
+)
+from e2e.services.dsource import DsourceNotFoundError, discover_dsource_name
+from tests.helpers.lifecycle import (
+    apply_action_idempotent,
+    assert_terminal_status,
+    get_or_create_subscription,
+    wait_for_demand_success,
+)
 
 logger = logging.getLogger(__name__)
 
-
-# ---------- Clients ----------
-
-@pytest.fixture(scope="session")
-def orcv2():
-    """Authenticated orchestrator gateway client."""
-    client = orcv2_gateway(base_url=os.environ["ORCV2_URL"])
-    client.set_bearer_token(os.environ["ORCV2_BEARER_TOKEN"])
-    return client
+# ... @scenario bindings unchanged ...
 
 
-@pytest.fixture(scope="session")
-def dlx() -> Iterator[DelphixClient]:
-    """Delphix DCT client — `/dsources` is public, no Authorization header."""
-    session = requests.Session()
-    session.headers["Accept"] = "application/json"
-    if cert := os.getenv("DLX_CERT"):
-        session.verify = cert
-
-    client = DelphixClient(
-        session=session,
-        base_url=os.environ["DLX_URL"].rstrip("/"),
+@then("the dSource is onboarded within one hour")
+def _dsource_onboarded(orcv2, dlx, pdb_subscription, vdb_state):
+    wait_for_demand_success(
+        orcv2, pdb_subscription, ONBOARDING_TIMEOUT_S, kind="DSOURCE",
     )
     try:
-        yield client
-    finally:
-        session.close()
+        dsource_name = discover_dsource_name(orcv2, dlx, pdb_subscription.id)
+    except DsourceNotFoundError as exc:
+        pytest.fail(f"[DSOURCE] Onboarding succeeded but discovery failed: {exc}")
 
-
-# ---------- State ----------
-
-@pytest.fixture(scope="session")
-def vdb_state() -> Iterator[dict[str, Any]]:
-    """Session-scoped state dict, persisted to vdb_state.json on session end."""
-    data = state_io.load()
-    try:
-        yield data
-    finally:
-        state_io.save(data)
-
-
-# ---------- Payloads ----------
-
-@pytest.fixture
-def master_payload(vdb_state, orcv2, dlx):
-    return build_vdb_payload(
-        vdb_type="MASTER",
-        description="Master VDB — E2E lifecycle test",
-        dsource_name=resolve_dsource_name(vdb_state, orcv2, dlx),
+    vdb_state[DSOURCE_NAME_STATE_KEY] = dsource_name
+    logger.info(
+        "[DSOURCE] Onboarded dsource_name=%s pdb_subscription_id=%s",
+        dsource_name, pdb_subscription.id,
     )
 
 
-@pytest.fixture
-def client_payload(vdb_state, orcv2, dlx):
-    return build_vdb_payload(
-        vdb_type="CLIENT",
-        description="Client VDB — E2E lifecycle test",
-        dsource_name=resolve_dsource_name(vdb_state, orcv2, dlx),
-    )
+=======
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+bdd_features_base_dir = "tests/features"
+
+=======
+
+.test_base:
+  before_script:
+    - source venv/bin/activate
+    - test -f .env && set -a && . ./.env && set +a || true
+  variables:
+    KEEP_VDB_AFTER_TEST: "1"
+  resource_group: delphix-e2e
+  artifacts:
+    when: always
+    paths:
+      - vdb_state.json
+      - reports/
 
 
-# ---------- Cleanup ----------
-
-@pytest.fixture
-def created_subscriptions(orcv2) -> Iterator[list]:
-    """Tracks subscriptions created during a test; best-effort cleanup at the end
-    unless KEEP_VDB_AFTER_TEST=1 (the default in CI to preserve work on retry)."""
-    tracked = []
-    yield tracked
-    if os.getenv("KEEP_VDB_AFTER_TEST") == "1":
-        return
-    for sub in tracked:
-        try:
-            orcv2.delete_subscription(sub.id)
-        except Exception as exc:
-            logger.warning("Best-effort delete failed for %s: %s", sub.id, exc)
 
 
-# ---------- pytest-bdd hooks ----------
-
-def pytest_bdd_before_scenario(request, feature, scenario):
-    logger.info("=== Scenario start: %s ===", scenario.name)
-
-
-def pytest_bdd_after_scenario(request, feature, scenario):
-    logger.info("=== Scenario end: %s ===", scenario.name)
