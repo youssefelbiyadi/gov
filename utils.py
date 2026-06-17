@@ -1,76 +1,50 @@
-"""E2E VDB lifecycle scenarios."""
-from __future__ import annotations
-
-import logging
-import os
-
-import pytest
-from pytest_bdd import given, scenario, then, when
-
-from e2e.constants import (
-    CLIENT_SUB_STATE_KEY,
-    DELETION_TIMEOUT_S,
-    DSOURCE_NAME_STATE_KEY,
-    MASTER_SUB_STATE_KEY,
-    ONBOARDING_TIMEOUT_S,
-    ONBOARD_ACTION,
-    ONBOARD_PAYLOAD,
-    PROVISIONING_TIMEOUT_S,
-    REFRESH_ACTION,
-    REFRESH_TIMEOUT_S,
-)
-from e2e.services.dsource import DsourceNotFoundError, discover_dsource_name
-from tests.helpers.lifecycle import (
-    apply_action_idempotent,
-    assert_terminal_status,
-    get_or_create_subscription,
-    wait_for_demand_success,
-)
-
-logger = logging.getLogger(__name__)
-
-# ... @scenario bindings unchanged ...
+def _ongoing_demands(sub: Subscription, action: str) -> list[Demand]:
+    """Demands on `sub` matching `action` that are still in-flight."""
+    return [
+        d for d in sub.demands
+        if d.action == action
+        and d.status in (DemandStatus.IN_PROGRESS, DemandStatus.ON_HOLD)
+    ]
 
 
-@then("the dSource is onboarded within one hour")
-def _dsource_onboarded(orcv2, dlx, pdb_subscription, vdb_state):
-    wait_for_demand_success(
-        orcv2, pdb_subscription, ONBOARDING_TIMEOUT_S, kind="DSOURCE",
-    )
-    try:
-        dsource_name = discover_dsource_name(orcv2, dlx, pdb_subscription.id)
-    except DsourceNotFoundError as exc:
-        pytest.fail(f"[DSOURCE] Onboarding succeeded but discovery failed: {exc}")
+def apply_action_idempotent(
+    orchestrator_v2,
+    subscription: Subscription,
+    action: str,
+    payload: dict | None = None,
+    *,
+    kind: Kind,
+) -> Subscription:
+    """Apply `action` to `subscription`, reusing any in-flight demand for the
+    same action instead of firing a duplicate.
 
-    vdb_state[DSOURCE_NAME_STATE_KEY] = dsource_name
-    logger.info(
-        "[DSOURCE] Onboarded dsource_name=%s pdb_subscription_id=%s",
-        dsource_name, pdb_subscription.id,
+    A demand is considered in-flight when its status is ON_HOLD or IN_PROGRESS.
+    If one is found, the subscription is returned as-is and the caller should
+    poll the existing demand. Otherwise the action is applied fresh and the
+    refreshed subscription is returned.
+    """
+    if in_flight := _ongoing_demands(subscription, action):
+        latest = in_flight[-1]
+        logger.info(
+            "[%s] Action %r already in flight demand_id=%s status=%s — reusing",
+            kind, action, latest.id, latest.status,
+        )
+        return subscription
+
+    refreshed = orchestrator_v2.apply_action_subscription(
+        subscription.id, action, payload=payload,
     )
 
-
-=======
-
-[tool.pytest.ini_options]
-pythonpath = ["."]
-testpaths = ["tests"]
-bdd_features_base_dir = "tests/features"
-
-=======
-
-.test_base:
-  before_script:
-    - source venv/bin/activate
-    - test -f .env && set -a && . ./.env && set +a || true
-  variables:
-    KEEP_VDB_AFTER_TEST: "1"
-  resource_group: delphix-e2e
-  artifacts:
-    when: always
-    paths:
-      - vdb_state.json
-      - reports/
-
-
-
-
+    new_demands = _ongoing_demands(refreshed, action)
+    if new_demands:
+        logger.info(
+            "[%s] Action %r triggered demand_id=%s",
+            kind, action, new_demands[-1].id,
+        )
+    else:
+        logger.warning(
+            "[%s] Action %r applied but no in-flight demand reported — "
+            "completed synchronously or not yet visible",
+            kind, action,
+        )
+    return refreshed
