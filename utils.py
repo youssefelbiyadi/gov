@@ -1,50 +1,46 @@
-def _ongoing_demands(sub: Subscription, action: str) -> list[Demand]:
-    """Demands on `sub` matching `action` that are still in-flight."""
-    return [
-        d for d in sub.demands
-        if d.action == action
-        and d.status in (DemandStatus.IN_PROGRESS, DemandStatus.ON_HOLD)
-    ]
-
-
-def apply_action_idempotent(
+def delete_subscription_idempotent(
     orchestrator_v2,
     subscription: Subscription,
-    action: str,
-    payload: dict | None = None,
     *,
     kind: Kind,
 ) -> Subscription:
-    """Apply `action` to `subscription`, reusing any in-flight demand for the
-    same action instead of firing a duplicate.
+    """Delete `subscription`, tolerating already-terminated and in-flight states.
 
-    A demand is considered in-flight when its status is ON_HOLD or IN_PROGRESS.
-    If one is found, the subscription is returned as-is and the caller should
-    poll the existing demand. Otherwise the action is applied fresh and the
-    refreshed subscription is returned.
+    Short-circuits when the subscription is already TERMINATED, or currently
+    TERMINATING (the caller should poll the existing delete demand).
     """
-    if in_flight := _ongoing_demands(subscription, action):
-        latest = in_flight[-1]
+    if subscription.status == SubscriptionStatus.TERMINATED:
         logger.info(
-            "[%s] Action %r already in flight demand_id=%s status=%s — reusing",
-            kind, action, latest.id, latest.status,
+            "[%s] Already TERMINATED subscription_id=%s — no-op",
+            kind, subscription.id,
         )
         return subscription
 
-    refreshed = orchestrator_v2.apply_action_subscription(
-        subscription.id, action, payload=payload,
+    if subscription.status == SubscriptionStatus.TERMINATING:
+        logger.info(
+            "[%s] Delete already in progress subscription_id=%s — reusing demand",
+            kind, subscription.id,
+        )
+        return subscription
+
+    orchestrator_v2.delete_subscription(subscription.id)
+    refreshed = orchestrator_v2.get_subscription(subscription.id)
+    logger.info(
+        "[%s] Delete requested subscription_id=%s",
+        kind, refreshed.id,
+    )
+    return refreshed
+
+
+@when("I delete the client VDB", target_fixture="client_subscription")
+def _delete_client(orchestrator_v2, client_subscription):
+    return delete_subscription_idempotent(
+        orchestrator_v2, client_subscription, kind="CLIENT",
     )
 
-    new_demands = _ongoing_demands(refreshed, action)
-    if new_demands:
-        logger.info(
-            "[%s] Action %r triggered demand_id=%s",
-            kind, action, new_demands[-1].id,
-        )
-    else:
-        logger.warning(
-            "[%s] Action %r applied but no in-flight demand reported — "
-            "completed synchronously or not yet visible",
-            kind, action,
-        )
-    return refreshed
+
+@when("I delete the master VDB", target_fixture="master_subscription")
+def _delete_master(orchestrator_v2, master_subscription):
+    return delete_subscription_idempotent(
+        orchestrator_v2, master_subscription, kind="MASTER",
+    )
