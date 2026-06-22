@@ -1,46 +1,27 @@
-def delete_subscription_idempotent(
-    orchestrator_v2,
-    subscription: Subscription,
-    *,
-    kind: Kind,
-) -> Subscription:
-    """Delete `subscription`, tolerating already-terminated and in-flight states.
+"""JSON-backed state shared across CI stages via the vdb_state.json artifact."""
+from __future__ import annotations
 
-    Short-circuits when the subscription is already TERMINATED, or currently
-    TERMINATING (the caller should poll the existing delete demand).
-    """
-    if subscription.status == SubscriptionStatus.TERMINATED:
-        logger.info(
-            "[%s] Already TERMINATED subscription_id=%s — no-op",
-            kind, subscription.id,
-        )
-        return subscription
+import json
+from pathlib import Path
+from typing import Any
+from uuid import UUID
 
-    if subscription.status == SubscriptionStatus.TERMINATING:
-        logger.info(
-            "[%s] Delete already in progress subscription_id=%s — reusing demand",
-            kind, subscription.id,
-        )
-        return subscription
-
-    orchestrator_v2.delete_subscription(subscription.id)
-    refreshed = orchestrator_v2.get_subscription(subscription.id)
-    logger.info(
-        "[%s] Delete requested subscription_id=%s",
-        kind, refreshed.id,
-    )
-    return refreshed
+DEFAULT_PATH = Path("vdb_state.json")
 
 
-@when("I delete the client VDB", target_fixture="client_subscription")
-def _delete_client(orchestrator_v2, client_subscription):
-    return delete_subscription_idempotent(
-        orchestrator_v2, client_subscription, kind="CLIENT",
-    )
+def _json_default(o: Any) -> str:
+    if isinstance(o, UUID):
+        return str(o)
+    if isinstance(o, Path):
+        return str(o)
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
 
 
-@when("I delete the master VDB", target_fixture="master_subscription")
-def _delete_master(orchestrator_v2, master_subscription):
-    return delete_subscription_idempotent(
-        orchestrator_v2, master_subscription, kind="MASTER",
-    )
+def load(path: Path = DEFAULT_PATH) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
+def save(state: dict[str, Any], path: Path = DEFAULT_PATH) -> None:
+    path.write_text(json.dumps(state, indent=2, sort_keys=True, default=_json_default))
