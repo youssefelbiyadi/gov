@@ -1,304 +1,222 @@
-####### client.py
+"""Lifecycle helpers — idempotency, demand tracking, polling, terminal asserts.
 
-"""HTTP client for the orchestrator API."""
+The orchestrator client returns a WriteResponse with a demand_id on create,
+apply_action, and delete. We persist that demand_id in vdb_state so retries
+can resume polling without reissuing the write.
+"""
 from __future__ import annotations
 
 import logging
-import time
-from dataclasses import dataclass
-from typing import Any
-from uuid import UUID
+from typing import Any, Literal
 
-import requests
-
-from delphix_e2e.models import (
-    Demand, DemandStatus, Subscription, WriteResponse,
-)
-
-from .auth import resolve_token
-from .errors import (
-    DemandFailedError, OrchestratorHTTPError, OrchestratorTimeoutError,
-)
-
-logger = logging.getLogger(__name__)
-
-_DEFAULT_TIMEOUT_S = 30
-_DEFAULT_POLL_INTERVAL_S = 30
-
-
-@dataclass
-class OrchestratorClient:
-    """Typed client for the orchestrator REST API."""
-    session: requests.Session
-    base_url: str
-
-    # ─── Factories ─────────────────────────────────────────────────────────
-
-    @classmethod
-    def from_token(
-        cls, base_url: str, token: str, session: requests.Session | None = None,
-    ) -> "OrchestratorClient":
-        """Build a client from a pre-acquired token."""
-        session = session or requests.Session()
-        session.headers.update({
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        })
-        return cls(session=session, base_url=base_url.rstrip("/"))
-
-    @classmethod
-    def from_env(
-        cls, base_url: str, session: requests.Session | None = None,
-    ) -> "OrchestratorClient":
-        """Build a client by resolving credentials from the environment.
-
-        Reads ORCV2_BEARER_TOKEN first, falls back to ORCV2_USERNAME +
-        ORCV2_PASSWORD for password auth.
-        """
-        session = session or requests.Session()
-        token = resolve_token(base_url, session=session)
-        return cls.from_token(base_url, token, session=session)
-
-    # ─── Subscriptions ─────────────────────────────────────────────────────
-
-    def create_subscription(self, payload: dict[str, Any]) -> WriteResponse:
-        data = self._post("/api/v1/subscriptions", json=payload)
-        return WriteResponse.from_dict(data)
-
-    def get_subscription(self, subscription_id: UUID | str) -> Subscription:
-        data = self._get(f"/api/v1/subscriptions/{subscription_id}")
-        return Subscription.from_dict(data)
-
-    def delete_subscription(
-        self, subscription_id: UUID | str, body: dict[str, Any] | None = None,
-    ) -> WriteResponse:
-        data = self._delete(
-            f"/api/v1/subscriptions/{subscription_id}",
-            json=body or {"payload": {}},
-        )
-        return WriteResponse.from_dict(data)
-
-    def apply_action(
-        self,
-        subscription_id: UUID | str,
-        action: str,
-        payload: dict[str, Any] | None = None,
-    ) -> WriteResponse:
-        data = self._post(
-            f"/api/v1/subscriptions/{subscription_id}/action/{action}",
-            json={"payload": payload or {}},
-        )
-        return WriteResponse.from_dict(data)
-
-    # ─── Demands ───────────────────────────────────────────────────────────
-
-    def list_subscription_demands(
-        self, subscription_id: UUID | str,
-    ) -> list[Demand]:
-        data = self._get(f"/api/v1/subscriptions/{subscription_id}/demands")
-        return [Demand.from_dict(d) for d in data.get("demands", [])]
-
-    def get_demand(self, demand_id: UUID | str) -> Demand:
-        data = self._get(f"/api/v1/demands/{demand_id}")
-        return Demand.from_dict(data)
-
-    def wait_for_demand(
-        self,
-        demand_id: UUID | str,
-        *,
-        target: DemandStatus = DemandStatus.SUCCESS,
-        timeout_s: int,
-        poll_interval_s: int = _DEFAULT_POLL_INTERVAL_S,
-    ) -> Demand:
-        """Poll a demand until it reaches `target` or a terminal failure."""
-        deadline = time.monotonic() + timeout_s
-        while True:
-            demand = self.get_demand(demand_id)
-
-            if demand.status == target:
-                logger.info("Demand %s reached %s", demand_id, target.value)
-                return demand
-
-            if demand.status.is_failure:
-                raise DemandFailedError(
-                    str(demand_id), demand.status.value, demand.status_reason,
-                )
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise OrchestratorTimeoutError(
-                    f"Demand {demand_id} did not reach {target.value} within "
-                    f"{timeout_s}s (last status: {demand.status.value})"
-                )
-
-            sleep_for = min(poll_interval_s, remaining)
-            logger.debug(
-                "Demand %s status=%s — sleeping %ds (remaining %ds)",
-                demand_id, demand.status.value, sleep_for, int(remaining),
-            )
-            time.sleep(sleep_for)
-
-    # ─── HTTP plumbing ─────────────────────────────────────────────────────
-
-    def _get(self, path: str) -> dict[str, Any]:
-        return self._request("GET", path)
-
-    def _post(self, path: str, *, json: dict[str, Any]) -> dict[str, Any]:
-        return self._request("POST", path, json=json)
-
-    def _delete(self, path: str, *, json: dict[str, Any]) -> dict[str, Any]:
-        return self._request("DELETE", path, json=json)
-
-    def _request(
-        self, method: str, path: str, *, json: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        url = f"{self.base_url}{path}"
-        try:
-            response = self.session.request(
-                method, url, json=json, timeout=_DEFAULT_TIMEOUT_S,
-            )
-        except requests.RequestException as exc:
-            raise OrchestratorHTTPError(0, f"Request failed: {exc}") from exc
-
-        if not response.ok:
-            raise OrchestratorHTTPError(
-                response.status_code,
-                f"{method} {path} failed",
-                body=response.text[:500],
-            )
-
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise OrchestratorHTTPError(
-                response.status_code,
-                f"{method} {path} returned non-JSON",
-                body=response.text[:500],
-            ) from exc
-
-###### auth.py
-
-"""Token acquisition and resolution for the orchestrator API."""
-from __future__ import annotations
-
-import logging
-import os
-from dataclasses import dataclass
-
-import requests
-
-from .errors import OrchestratorAuthError
-
-logger = logging.getLogger(__name__)
-
-# Env var names — kept here so they're discoverable from one place.
-TOKEN_ENV_VAR = "ORCV2_BEARER_TOKEN"
-USERNAME_ENV_VAR = "ORCV2_USERNAME"
-PASSWORD_ENV_VAR = "ORCV2_PASSWORD"
-
-
-@dataclass(frozen=True)
-class TokenProvider:
-    """Acquires a bearer token from POST /auth/token.
-
-    Use directly when you have credentials in hand. For environment-driven
-    resolution, use `resolve_token` instead.
-    """
-    base_url: str
-    username: str
-    password: str
-    session: requests.Session
-
-    def acquire(self) -> str:
-        url = f"{self.base_url}/auth/token"
-        try:
-            response = self.session.post(
-                url,
-                json={"username": self.username, "password": self.password},
-                timeout=30,
-            )
-        except requests.RequestException as exc:
-            raise OrchestratorAuthError(f"Auth request failed: {exc}") from exc
-
-        if response.status_code != 200:
-            raise OrchestratorAuthError(
-                f"Auth returned HTTP {response.status_code}: {response.text[:200]}"
-            )
-
-        try:
-            token = response.json()["access_token"]
-        except (KeyError, ValueError) as exc:
-            raise OrchestratorAuthError(
-                f"Auth response missing access_token: {response.text[:200]}"
-            ) from exc
-
-        logger.info("Acquired orchestrator bearer token via password auth")
-        return token
-
-
-def resolve_token(
-    base_url: str, session: requests.Session | None = None,
-) -> str:
-    """Resolve a bearer token from the environment.
-
-    Precedence:
-        1. ORCV2_BEARER_TOKEN — pre-acquired token (the CI default).
-        2. ORCV2_USERNAME + ORCV2_PASSWORD — password auth (local dev fallback).
-
-    Raises:
-        OrchestratorAuthError: when neither path yields a token.
-    """
-    if token := os.getenv(TOKEN_ENV_VAR):
-        logger.info("Using orchestrator token from %s", TOKEN_ENV_VAR)
-        return token
-
-    username = os.getenv(USERNAME_ENV_VAR)
-    password = os.getenv(PASSWORD_ENV_VAR)
-    if username and password:
-        provider = TokenProvider(
-            base_url=base_url,
-            username=username,
-            password=password,
-            session=session or requests.Session(),
-        )
-        return provider.acquire()
-
-    raise OrchestratorAuthError(
-        f"No credentials: set {TOKEN_ENV_VAR}, or both "
-        f"{USERNAME_ENV_VAR} and {PASSWORD_ENV_VAR}"
-    )
-
-##### __init__
-
-"""Orchestrator HTTP adapter."""
-from .auth import (
-    PASSWORD_ENV_VAR,
-    TOKEN_ENV_VAR,
-    TokenProvider,
-    USERNAME_ENV_VAR,
-    resolve_token,
-)
-from .client import OrchestratorClient
-from .errors import (
+from delphix_e2e.adapters.orchestrator import (
     DemandFailedError,
-    OrchestratorAuthError,
-    OrchestratorError,
-    OrchestratorHTTPError,
+    OrchestratorClient,
     OrchestratorTimeoutError,
 )
+from delphix_e2e.models import (
+    DemandStatus, Subscription, SubscriptionStatus, WriteResponse,
+)
 
-__all__ = [
-    "DemandFailedError",
-    "OrchestratorAuthError",
-    "OrchestratorClient",
-    "OrchestratorError",
-    "OrchestratorHTTPError",
-    "OrchestratorTimeoutError",
-    "PASSWORD_ENV_VAR",
-    "TOKEN_ENV_VAR",
-    "TokenProvider",
-    "USERNAME_ENV_VAR",
-    "resolve_token",
-]
+logger = logging.getLogger(__name__)
 
+Kind = Literal["PDB", "DSOURCE", "MASTER", "CLIENT"]
+
+
+# ─── Create / get-or-create ────────────────────────────────────────────────
+
+def get_or_create_subscription(
+    client: OrchestratorClient,
+    sub_key: str,
+    demand_key: str,
+    payload: dict[str, Any],
+    vdb_state: dict[str, Any],
+    created_subscriptions: list[str],
+    *,
+    kind: Kind,
+) -> Subscription:
+    """Reuse the subscription from state if still healthy, else create fresh.
+    Persists the create-demand id into `vdb_state[demand_key]` for polling."""
+    if existing_id := vdb_state.get(sub_key):
+        existing = client.get_subscription(existing_id)
+        if existing.status not in (
+            SubscriptionStatus.TERMINATED, SubscriptionStatus.FAILED,
+        ):
+            logger.info(
+                "[%s] Reusing subscription_id=%s status=%s",
+                kind, existing.id, existing.status.value,
+            )
+            return existing
+        logger.info(
+            "[%s] subscription_id=%s is %s — creating fresh",
+            kind, existing.id, existing.status.value,
+        )
+
+    response = client.create_subscription(payload)
+    created_subscriptions.append(str(response.subscription_id))
+
+    vdb_state[sub_key] = str(response.subscription_id)
+    vdb_state[demand_key] = str(response.demand_id)
+    logger.info(
+        "[%s] Created subscription_id=%s demand_id=%s",
+        kind, response.subscription_id, response.demand_id,
+    )
+
+    return client.get_subscription(response.subscription_id)
+
+
+# ─── Actions (refresh, onboard, ...) ───────────────────────────────────────
+
+def apply_action_idempotent(
+    client: OrchestratorClient,
+    subscription: Subscription,
+    action: str,
+    payload: dict[str, Any] | None,
+    vdb_state: dict[str, Any],
+    demand_key: str,
+    *,
+    kind: Kind,
+) -> Subscription:
+    """Apply `action` on `subscription`, reusing any pending demand recorded
+    in state. The new demand id is written to `vdb_state[demand_key]`."""
+    if pending := vdb_state.get(demand_key):
+        logger.info(
+            "[%s] Pending demand_id=%s already recorded for action %r — reusing",
+            kind, pending, action,
+        )
+        return subscription
+
+    response = client.apply_action(subscription.id, action, payload=payload)
+    vdb_state[demand_key] = str(response.demand_id)
+    logger.info(
+        "[%s] Action %r triggered demand_id=%s",
+        kind, action, response.demand_id,
+    )
+
+    return client.get_subscription(subscription.id)
+
+
+# ─── Delete ────────────────────────────────────────────────────────────────
+
+def delete_subscription_idempotent(
+    client: OrchestratorClient,
+    subscription: Subscription,
+    vdb_state: dict[str, Any],
+    demand_key: str,
+    *,
+    kind: Kind,
+) -> Subscription:
+    """Delete `subscription`, tolerating already-terminated and in-flight states.
+    Persists the delete demand id into state for polling."""
+    if subscription.status == SubscriptionStatus.TERMINATED:
+        logger.info(
+            "[%s] Already TERMINATED subscription_id=%s — no-op",
+            kind, subscription.id,
+        )
+        vdb_state.pop(demand_key, None)
+        return subscription
+
+    if subscription.status == SubscriptionStatus.TERMINATING:
+        if pending := vdb_state.get(demand_key):
+            logger.info(
+                "[%s] Delete already in progress demand_id=%s — reusing",
+                kind, pending,
+            )
+            return subscription
+        logger.warning(
+            "[%s] subscription_id=%s is TERMINATING but no delete demand "
+            "recorded — re-issuing delete",
+            kind, subscription.id,
+        )
+
+    response = client.delete_subscription(subscription.id)
+    vdb_state[demand_key] = str(response.demand_id)
+    logger.info(
+        "[%s] Delete requested subscription_id=%s demand_id=%s",
+        kind, subscription.id, response.demand_id,
+    )
+
+    return client.get_subscription(subscription.id)
+
+
+# ─── Polling ───────────────────────────────────────────────────────────────
+
+def wait_for_demand_success(
+    client: OrchestratorClient,
+    vdb_state: dict[str, Any],
+    demand_key: str,
+    timeout_s: int,
+    *,
+    kind: Kind,
+    poll_interval_s: int = 30,
+) -> None:
+    """Poll the demand id recorded in `vdb_state[demand_key]` until SUCCESS.
+
+    On success, clears the key from state so the next operation starts clean.
+    On failure (timeout or terminal-failure status), leaves the key in place
+    for debugging and raises AssertionError.
+    """
+    demand_id = vdb_state.get(demand_key)
+    if demand_id is None:
+        logger.info("[%s] No pending demand recorded — nothing to wait on", kind)
+        return
+
+    logger.info(
+        "[%s] Waiting for demand_id=%s up to %d seconds",
+        kind, demand_id, timeout_s,
+    )
+    try:
+        client.wait_for_demand(
+            demand_id,
+            target=DemandStatus.SUCCESS,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+    except DemandFailedError as exc:
+        raise AssertionError(f"[{kind}] {exc}") from exc
+    except OrchestratorTimeoutError as exc:
+        raise AssertionError(f"[{kind}] {exc}") from exc
+
+    logger.info("[%s] demand_id=%s reached SUCCESS", kind, demand_id)
+    vdb_state.pop(demand_key, None)
+
+
+# ─── Terminal assertion ────────────────────────────────────────────────────
+
+def assert_terminal_status(
+    client: OrchestratorClient,
+    subscription: Subscription,
+    expected: SubscriptionStatus,
+    vdb_state: dict[str, Any],
+    demand_key: str,
+    timeout_s: int,
+    *,
+    kind: Kind,
+) -> None:
+    """Wait for the recorded demand, then assert subscription reached `expected`.
+
+    Short-circuits if the subscription is already at `expected` — handles the
+    case where the DAG finished while the GitLab runner died, so the retry
+    sees the final state without re-polling.
+    """
+    if subscription.status == expected:
+        logger.info(
+            "[%s] subscription_id=%s already at %s — no wait needed",
+            kind, subscription.id, expected.value,
+        )
+        vdb_state.pop(demand_key, None)
+        return
+
+    wait_for_demand_success(
+        client, vdb_state, demand_key, timeout_s, kind=kind,
+    )
+
+    final = client.get_subscription(subscription.id)
+    assert final.status == expected, (
+        f"[{kind}] Expected {expected.value}, got {final.status.value} "
+        f"(subscription_id={subscription.id})"
+    )
+    logger.info(
+        "[%s] subscription_id=%s reached %s",
+        kind, subscription.id, expected.value,
+    )
