@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
-# Restore vdb_state.json from the latest artifact of the current job on
-# the current ref. Used by every test stage so a retried job inherits the
-# state its previous attempt persisted — GitLab's "retry job" doesn't carry
-# artifacts across attempts by default.
-#
-# Silent no-op when:
-#   - vdb_state.json already exists (e.g. needs: chain provided it)
-#   - no previous artifact exists on this ref (first-ever run)
+# Restore vdb_state.json from a prior attempt of this job within the current
+# pipeline. Pipeline-scoped — never crosses pipeline boundaries, so retrying
+# an old job after the branch has moved forward will not pick up a newer
+# pipeline's artifact.
 #
 # Authenticates via CI_JOB_TOKEN — no PAT required.
 
@@ -19,43 +15,44 @@ if [ -f "$STATE_FILE" ]; then
   exit 0
 fi
 
-URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/jobs/artifacts/${CI_COMMIT_REF_NAME}/raw/${STATE_FILE}?job=${CI_JOB_NAME}"
+echo "[restore-state] Searching pipeline=$CI_PIPELINE_ID for prior $CI_JOB_NAME with artifacts"
 
-echo "[restore-state] Fetching previous $STATE_FILE for job=$CI_JOB_NAME ref=$CI_COMMIT_REF_NAME"
+JOBS_JSON=$(curl --fail --silent --show-error \
+  --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+  "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/pipelines/${CI_PIPELINE_ID}/jobs?per_page=100")
+
+JOB_ID=$(echo "$JOBS_JSON" | python3 -c '
+import json, os, sys
+
+jobs = json.load(sys.stdin)
+name = os.environ["CI_JOB_NAME"]
+current_id = os.environ["CI_JOB_ID"]
+
+candidates = [
+    j for j in jobs
+    if j["name"] == name
+    and str(j["id"]) != current_id
+    and j.get("artifacts_file")
+]
+candidates.sort(key=lambda j: j.get("finished_at") or "", reverse=True)
+print(candidates[0]["id"] if candidates else "")
+')
+
+if [ -z "$JOB_ID" ]; then
+  echo "[restore-state] No prior $CI_JOB_NAME attempt in this pipeline — starting fresh"
+  exit 0
+fi
+
+echo "[restore-state] Found prior job_id=$JOB_ID, fetching $STATE_FILE"
 
 HTTP_STATUS=$(curl --silent --show-error --location --output "$STATE_FILE" \
   --write-out "%{http_code}" \
   --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
-  "$URL")
+  "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/jobs/${JOB_ID}/artifacts/${STATE_FILE}")
 
-case "$HTTP_STATUS" in
-  200)
-    echo "[restore-state] Restored $STATE_FILE ($(wc -c < "$STATE_FILE") bytes)"
-    ;;
-  404)
-    rm -f "$STATE_FILE"
-    echo "[restore-state] No prior artifact — starting fresh"
-    ;;
-  *)
-    rm -f "$STATE_FILE"
-    echo "[restore-state] Unexpected HTTP $HTTP_STATUS — starting fresh" >&2
-    ;;
-esac
-
-
-
-.test_base:
-  resource_group: delphix-e2e
-  image: ${PYTHON_IMAGE}
-  before_script:
-    - source venv/bin/activate
-    - ./scripts/restore_vdb_state.sh
-    - test -f .env && set -a && . ./.env && set +a || true
-  variables:
-    KEEP_VDB_AFTER_TEST: "1"
-  artifacts:
-    when: always
-    paths:
-      - reports/
-      - vdb_state.json
-    expire_in: 7 days
+if [ "$HTTP_STATUS" = "200" ]; then
+  echo "[restore-state] Restored $STATE_FILE ($(wc -c < "$STATE_FILE") bytes)"
+else
+  rm -f "$STATE_FILE"
+  echo "[restore-state] Unexpected HTTP $HTTP_STATUS fetching artifact — starting fresh" >&2
+fi
