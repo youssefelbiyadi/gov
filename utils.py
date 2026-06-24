@@ -1,66 +1,44 @@
-"""dSource discovery and name resolution against the Delphix DCT API."""
+"""Centralized constants — timeouts, action names, state keys."""
 from __future__ import annotations
 
-import logging
-import os
-from typing import Any
+from typing import Final
 
-from delphix_e2e.adapters.delphix import DelphixClient
-from delphix_e2e.constants import DSOURCE_NAME_KEY
+# ─── Timeouts (seconds) ────────────────────────────────────────────────────
+ONBOARDING_TIMEOUT_S: Final[int] = 60 * 60
+PROVISIONING_TIMEOUT_S: Final[int] = 2 * 60 * 60
+REFRESH_TIMEOUT_S: Final[int] = 60 * 60
+DELETION_TIMEOUT_S: Final[int] = 30 * 60
 
-logger = logging.getLogger(__name__)
+# ─── Orchestrator actions ──────────────────────────────────────────────────
+ONBOARD_ACTION: Final[str] = "onboard_delphix"
+REFRESH_ACTION: Final[str] = "refresh"
 
+ONBOARD_PAYLOAD: Final[dict[str, bool]] = {"trigger_master_vdb_dag": False}
 
-class DsourceNotFoundError(RuntimeError):
-    """No ACTIVE dSource matches the given PDB."""
+# ─── State keys (persisted to vdb_state.json) ──────────────────────────────
+# Convention:
+#   <resource>_<operation>_demand_id  — per-operation demand handle
+#   <resource>_subscription_id        — the subscription's UUID
+#
+# A demand key is written when its operation is fired and cleared once the
+# demand reaches SUCCESS. Operation-scoped naming prevents the refresh demand
+# from clobbering the create demand on the same resource, which matters for
+# retries: each stage owns its own handle.
 
+DSOURCE_NAME_KEY: Final[str] = "dsource_name"
 
-def discover_dsource_name(
-    orchestrator_v2, dlx: DelphixClient, pdb_subscription_id: str,
-) -> str:
-    """Find the ACTIVE dSource onboarded for a given PDB subscription.
+# PDB — onboarding is a day-2 action on a pre-existing subscription; the PDB
+# subscription id is provided via env, so we only track the onboard demand.
+PDB_ONBOARD_DEMAND_KEY: Final[str] = "pdb_onboard_demand_id"
 
-        1. Read the PDB subscription's `name` (PDB identifier) and `apcode`.
-        2. List dSources scoped to that ap_code (server-side narrowing).
-        3. Keep only those whose `pdb_name` matches exactly and status == ACTIVE.
-        4. Return the dSource's `name` — used as `dsource_name` in VDB payloads.
-    """
-    pdb = orchestrator_v2.get_subscription(pdb_subscription_id)
-    pdb_name, ap_code = pdb.name, pdb.apcode
+# Master VDB
+MASTER_SUBSCRIPTION_KEY: Final[str] = "master_subscription_id"
+MASTER_CREATE_DEMAND_KEY: Final[str] = "master_create_demand_id"
+MASTER_REFRESH_DEMAND_KEY: Final[str] = "master_refresh_demand_id"
+MASTER_DELETE_DEMAND_KEY: Final[str] = "master_delete_demand_id"
 
-    active = [
-        d for d in dlx.list_dsources(ap_code=ap_code)
-        if d.get("pdb_name") == pdb_name and d.get("status") == "ACTIVE"
-    ]
-    if not active:
-        raise DsourceNotFoundError(
-            f"No ACTIVE dSource for pdb_name={pdb_name} ap_code={ap_code}"
-        )
-    if len(active) > 1:
-        logger.warning(
-            "[DSOURCE] %d ACTIVE dSources for pdb_name=%s — picking %s (others: %s)",
-            len(active), pdb_name, active[0]["name"],
-            [d["name"] for d in active[1:]],
-        )
-    return active[0]["name"]
-
-
-def resolve_dsource_name(
-    state: dict[str, Any], orchestrator_v2, dlx: DelphixClient,
-) -> str:
-    """Resolve the dSource name from the cheapest source first:
-
-        1. Cached in state (set by @dsource_onboard earlier in the pipeline).
-        2. DSOURCE_NAME env var (local-dev override).
-        3. Live discovery via PDB → DCT, then cached into state.
-    """
-    if cached := state.get(DSOURCE_NAME_KEY):
-        return cached
-    if override := os.getenv("DSOURCE_NAME"):
-        return override
-
-    name = discover_dsource_name(
-        orchestrator_v2, dlx, os.environ["PDB_SUBSCRIPTION_ID"],
-    )
-    state[DSOURCE_NAME_KEY] = name
-    return name
+# Client VDB
+CLIENT_SUBSCRIPTION_KEY: Final[str] = "client_subscription_id"
+CLIENT_CREATE_DEMAND_KEY: Final[str] = "client_create_demand_id"
+CLIENT_REFRESH_DEMAND_KEY: Final[str] = "client_refresh_demand_id"
+CLIENT_DELETE_DEMAND_KEY: Final[str] = "client_delete_demand_id"
