@@ -1,96 +1,103 @@
-#!/usr/bin/env bash
-# Restore vdb_state.json from a prior attempt of this job within the current
-# pipeline, so a retried job inherits the state its previous attempt persisted.
-#
-# Pipeline-scoped: never crosses pipeline boundaries — retrying an old job
-# after the branch has moved forward will not pick up a newer pipeline's
-# artifact.
-#
-# Authenticates via GITLAB_PAT (PRIVATE-TOKEN). The token needs `read_api`.
+"""Snapshot resolution for client VDB provisioning."""
+from __future__ import annotations
 
-set -euo pipefail
+import logging
+import os
 
-readonly STATE_FILE="vdb_state.json"
-readonly LOG_PREFIX="[restore-state]"
+from delphix_e2e.adapters.delphix import DelphixClient
+from delphix_e2e.constants import SNAPSHOT_ID_OVERRIDE
 
-log()  { echo "${LOG_PREFIX} $*"; }
-warn() { echo "${LOG_PREFIX} $*" >&2; }
+logger = logging.getLogger(__name__)
 
-# ─── Preconditions ─────────────────────────────────────────────────────────
 
-if [ -f "$STATE_FILE" ]; then
- log "$STATE_FILE already present — skipping fetch"
- exit 0
-fi
+class SnapshotNotFoundError(RuntimeError):
+    """No snapshot found on the given master VDB."""
 
-if [ -z "${GITLAB_PAT:-}" ]; then
- warn "GITLAB_PAT not set — cannot fetch prior artifacts, starting fresh"
- exit 0
-fi
 
-# ─── Step 1: list jobs in the current pipeline ─────────────────────────────
+def resolve_snapshot_id(
+    orchestrator_client,
+    dlx_client: DelphixClient,
+    master_subscription_id: str,
+) -> str:
+    """Resolve the snapshot id to use for client VDB provisioning.
 
-readonly JOBS_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/pipelines/${CI_PIPELINE_ID}/jobs?per_page=100"
+    Precedence:
+        1. SNAPSHOT_ID_OVERRIDE env var (operator override for one-off runs).
+        2. Latest snapshot on the master VDB via DCT.
 
-log "Pipeline=${CI_PIPELINE_ID} job=${CI_JOB_NAME}"
-log "GET ${JOBS_URL}"
+    Raises:
+        SnapshotNotFoundError: when DCT returns no snapshots for the master.
+    """
+    if override := os.getenv(SNAPSHOT_ID_OVERRIDE):
+        logger.info("[SNAPSHOT] Using override from %s=%s", SNAPSHOT_ID_OVERRIDE, override)
+        return override
 
-JOBS_BODY=$(mktemp)
-trap 'rm -f "$JOBS_BODY"' EXIT
+    master = orchestrator_client.get_subscription(master_subscription_id)
+    master_vdb_id = master.raw["state"]["data"]["delphix_id"]
 
-JOBS_STATUS=$(curl --silent --show-error --output "$JOBS_BODY" \
- --write-out "%{http_code}" \
- --header "PRIVATE-TOKEN: ${GITLAB_PAT}" \
- "$JOBS_URL")
+    snapshot = dlx_client.get_latest_vdb_snapshot(master_vdb_id)
+    if not snapshot:
+        raise SnapshotNotFoundError(
+            f"No snapshots found on master VDB delphix_id={master_vdb_id} "
+            f"(subscription_id={master_subscription_id})"
+        )
 
-if [ "$JOBS_STATUS" != "200" ]; then
- warn "Could not list pipeline jobs (HTTP ${JOBS_STATUS}) — starting fresh"
- warn "Response: $(head -c 300 "$JOBS_BODY")"
- exit 0
-fi
+    snapshot_id = snapshot["id"]
+    logger.info(
+        "[SNAPSHOT] Latest snapshot_id=%s from master_vdb_id=%s",
+        snapshot_id, master_vdb_id,
+    )
+    return snapshot_id
 
-# ─── Step 2: find latest prior attempt of this job with an artifact ────────
+def get_latest_vdb_snapshot(self, vdb_id: str) -> dict[str, Any] | None:
+    """Return the most recent snapshot on `vdb_id`, or None if there aren't any."""
+    response = self.session.get(
+        f"{self.base_url.rstrip('/')}/vdbs/{vdb_id}/snapshots",
+        params={"order_by": "creation_date", "order": "desc", "limit": 1},
+        timeout=30,
+    )
+    response.raise_for_status()
+    snapshots = response.json().get("snapshots") or []
+    return snapshots[0] if snapshots else None
 
-JOB_ID=$(python3 - "$JOBS_BODY" <<'PY'
-import json, os, sys
 
-with open(sys.argv[1]) as f:
-   jobs = json.load(f)
+def build_vdb_payload(
+    vdb_type: str,
+    description: str,
+    dsource_name: str,
+    snapshot_id: str | None = None,
+) -> dict[str, Any]:
+    spec: dict[str, Any] = {"dsource_name": dsource_name, "vdb_type": vdb_type}
+    if vdb_type == "MASTER":
+        spec["bu"] = "DELPHIX"
+    if snapshot_id:
+        spec["snapshot_id"] = snapshot_id
 
-name = os.environ["CI_JOB_NAME"]
-current_id = os.environ["CI_JOB_ID"]
+    payload = _base_vdb_payload(spec=spec, description=description)
+    payload["environment"] = os.getenv(ENVIRONMENT) or _get_vdb_environment(vdb_type)
+    payload["realm"] = _get_vdb_realm(vdb_type)
+    return payload
 
-candidates = [
-   j for j in jobs
-   if j["name"] == name
-   and str(j["id"]) != current_id
-   and j.get("artifacts_file")
-]
-candidates.sort(key=lambda j: j.get("finished_at") or "", reverse=True)
-print(candidates[0]["id"] if candidates else "")
-PY
-)
+@pytest.fixture
+def client_payload(
+    vdb_state,
+    orchestrator_v2,
+    delphix_client,
+) -> dict[str, Any]:
+    master_subscription_id = vdb_state[MASTER_SUBSCRIPTION_KEY]
 
-if [ -z "$JOB_ID" ]; then
- log "No prior ${CI_JOB_NAME} attempt with an artifact in this pipeline — starting fresh"
- exit 0
-fi
+    return build_vdb_payload(
+        vdb_type="CLIENT",
+        description="Client VDB — E2E lifecycle test",
+        dsource_name=resolve_dsource_name(
+            orchestrator_client=orchestrator_v2,
+            state=vdb_state,
+            dlx_client=delphix_client,
+        ),
+        snapshot_id=resolve_snapshot_id(
+            orchestrator_client=orchestrator_v2,
+            dlx_client=delphix_client,
+            master_subscription_id=master_subscription_id,
+        ),
+    )
 
-# ─── Step 3: download the artifact from that prior attempt ─────────────────
-
-readonly ARTIFACT_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/jobs/${JOB_ID}/artifacts/${STATE_FILE}"
-
-log "Found prior job_id=${JOB_ID}"
-log "GET ${ARTIFACT_URL}"
-
-ARTIFACT_STATUS=$(curl --silent --show-error --location --output "$STATE_FILE" \
- --write-out "%{http_code}" \
- --header "PRIVATE-TOKEN: ${GITLAB_PAT}" \
- "$ARTIFACT_URL")
-
-if [ "$ARTIFACT_STATUS" = "200" ]; then
- log "Restored ${STATE_FILE} ($(wc -c < "$STATE_FILE") bytes)"
-else
- rm -f "$STATE_FILE"
- warn "Could not fetch artifact (HTTP ${ARTIFACT_STATUS}) — starting fresh"
-fi
