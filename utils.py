@@ -164,6 +164,19 @@ def list_engine_onboarding_candidates(
           description: Number of Engines able to host the DSource.
 
 
+can_onboard:
+  type: boolean
+  description: Whether this engine is opted in to host newly onboarded DSources.
+reserved_sources:
+  type: array
+  items:
+    type: string
+  description: Source PDB names this engine is reserved for. Empty means not reserved.
+reserved_apcodes:
+  type: array
+  items:
+    type: string
+  description: AP-codes this engine is reserved for. Empty means not reserved.
 
 
 
